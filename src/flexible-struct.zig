@@ -81,7 +81,6 @@ pub fn Struct(LayoutT: type, options: Options) type {
         /// an enum of Layout field names followed by decl names.
         pub const FieldOrDecl = @Enum(FieldOrDeclInt, .exhaustive, fields_decls, &simd.iota(FieldOrDeclInt, fields_decls.len));
         const layout_struct = @typeInfo(Layout).@"struct";
-        const layout_fields = layout_struct.fields;
         /// user map of flexible field names to Layout field or decl names.
         const flexible_array_capacities = if (@hasDecl(Layout, "flexible_array_capacities"))
             Layout.flexible_array_capacities
@@ -90,18 +89,17 @@ pub fn Struct(LayoutT: type, options: Options) type {
 
         /// field bitsets in unsorted Field order.
         const layout_field_sets = sets: {
-            var flexibles = enums.EnumSet(Field).initEmpty();
-            var capacities = enums.EnumSet(Field).initEmpty();
-            for (@typeInfo(@TypeOf(flexible_array_capacities)).@"struct".fields) |flexible| {
-                if (!@hasField(Field, flexible.name))
-                    @compileError("'" ++ flexible.name ++ "' is not a Layout field.");
-                flexibles.insert(@field(Field, flexible.name));
-                const capacity: FieldOrDecl = @field(flexible_array_capacities, flexible.name);
-                const capname = @tagName(capacity);
-                if (@hasField(Layout, capname) and @typeInfo(@FieldType(Layout, capname)) == .int)
-                    capacities.insert(@field(Field, capname))
-                else if (!@hasDecl(Layout, capname))
-                    @compileError("flexible_array_capacities missing Layout field or declaration: '" ++ flexible.name ++ "'");
+            var flexibles = enums.EnumSet(Field).empty;
+            var capacities = enums.EnumSet(Field).empty;
+            for (@typeInfo(@TypeOf(flexible_array_capacities)).@"struct".field_names) |flexible_name| {
+                if (!@hasField(Field, flexible_name))
+                    @compileError("'" ++ flexible_name ++ "' is not a Layout field.");
+                flexibles.insert(@field(Field, flexible_name));
+                const capacity = @tagName(@field(flexible_array_capacities, flexible_name));
+                if (@hasField(Layout, capacity) and @typeInfo(@FieldType(Layout, capacity)) == .int)
+                    capacities.insert(@field(Field, capacity))
+                else if (!@hasDecl(Layout, capacity))
+                    @compileError("flexible_array_capacities missing Layout field or declaration: '" ++ flexible_name ++ "'");
             }
             break :sets .{ flexibles, capacities };
         };
@@ -110,18 +108,17 @@ pub fn Struct(LayoutT: type, options: Options) type {
 
         const layout_infos = blk: {
             var maxalign: mem.Alignment = .of(Layout);
-            for (layout_fields) |field| {
+            for (meta.tags(Field)) |field| {
                 maxalign = maxalign.max(.fromByteUnits(AlignOf(field)));
             }
             var flexsizes: FlexSizes = undefined;
             var nextflexaligns: FlexSizes = undefined;
             for (0..NFLEX_FIELDS) |i| {
-                const field = layout_fields[@intFromEnum(flexible_field_ids[i])];
                 nextflexaligns[i] = if (i < (NFLEX_FIELDS - 1))
-                    AlignOf(layout_fields[@intFromEnum(flexible_field_ids[i + 1])])
+                    AlignOf(flexible_field_ids[i + 1])
                 else
                     1; // don't pad last field.  it must be done separately in calcOffsets.
-                flexsizes[i] = @sizeOf(ElementOf(@field(Field, field.name)));
+                flexsizes[i] = @sizeOf(ElementOf(flexible_field_ids[i]));
             }
 
             break :blk .{ maxalign, flexsizes, nextflexaligns };
@@ -138,7 +135,7 @@ pub fn Struct(LayoutT: type, options: Options) type {
         pub const Capacities = @Struct(
             .@"extern",
             null,
-            &mapFields(StructField, .name, filterSlice(layout_fields, capacity_field_set)),
+            filterSlice(layout_struct.field_names, capacity_field_set),
             &@splat(Size),
             &@splat(.{}),
         );
@@ -146,22 +143,23 @@ pub fn Struct(LayoutT: type, options: Options) type {
         // # sorted fields section
 
         const Sort = struct {
-            fn lessThanAlign(_: void, lhs: StructField, rhs: StructField) bool {
+            fn lessThanAlign(_: void, lhs: Field, rhs: Field) bool {
                 return AlignOf(lhs) > AlignOf(rhs);
             }
         };
         /// sorted by alignment desc
-        const flexible_fields_sorted = fields: {
-            const fieldsraw = filterSlice(layout_fields, flexible_field_set);
-            var fields = fieldsraw[0..fieldsraw.len].*;
-            mem.sort(StructField, &fields, {}, Sort.lessThanAlign);
+        const flexible_fields_sorted: [NFIELDS]Field = fields: {
+            if (NFIELDS == 0)
+                break :fields .{};
+            var fields = meta.tags(Field).*;
+            mem.sort(Field, &fields, {}, Sort.lessThanAlign);
             break :fields fields;
         };
         const flexible_field_ids = ids: {
             var ids: []const Field = &.{};
             for (flexible_fields_sorted) |f| {
                 if (isFlexibleArray(f))
-                    ids = ids ++ .{@field(Field, f.name)};
+                    ids = ids ++ .{f};
             }
             break :ids ids;
         };
@@ -180,7 +178,7 @@ pub fn Struct(LayoutT: type, options: Options) type {
         };
 
         pub const ALIGN = alignment.toByteUnits();
-        pub const NFIELDS = layout_fields.len;
+        pub const NFIELDS = layout_struct.field_names.len;
         pub const NCAP_FIELDS = capacity_field_set.count();
         pub const NFLEX_FIELDS = flexible_field_set.count();
         pub const FIRST_FLEX_OFFSET = mem.alignForward(Size, @sizeOf(Layout), FLEX_ALIGN);
@@ -216,7 +214,8 @@ pub fn Struct(LayoutT: type, options: Options) type {
             if (false and NFLEX_FIELDS > 0 and !@inComptime()) {
                 std.debug.print(
                     \\
-                    \\fields            {any}
+                    \\Layout fields     {any}
+                    \\       size       {}
                     \\flex_field_sizes  {any}
                     \\next_field_aligns {any}
                     \\capacities        {any}
@@ -225,10 +224,9 @@ pub fn Struct(LayoutT: type, options: Options) type {
                     \\offsets           {any}
                     \\ALIGN             {}
                     \\FIRST_FLEX_OFFSET {}
-                    \\Layout size       {}
                     \\
                 ,
-                    .{ comptime meta.tags(Field), flex_field_sizes, next_flexfield_aligns, capacities, sizes, sizesaligned, offsets, ALIGN, FIRST_FLEX_OFFSET, @sizeOf(Layout) },
+                    .{ comptime meta.tags(Field), @sizeOf(Layout), flex_field_sizes, next_flexfield_aligns, capacities, sizes, sizesaligned, offsets, ALIGN, FIRST_FLEX_OFFSET },
                 );
             }
             return offsets;
@@ -353,8 +351,7 @@ pub fn Struct(LayoutT: type, options: Options) type {
         }
 
         pub fn destroy(self: *const Self, allocator: mem.Allocator) void {
-            const bytes = self.asBytes();
-            allocator.free(bytes[0..self.sizeInBytes()]);
+            allocator.free(self.asBytes()[0..self.sizeInBytes()]);
         }
 
         /// a Layout.<field> by value.
@@ -374,7 +371,7 @@ pub fn Struct(LayoutT: type, options: Options) type {
 
         /// a slice of Layout.<field> with the given len.
         pub fn sliceLen(self: *const Self, comptime field: Field, len: anytype) FieldSlice(field) {
-            return @ptrCast(value(self, field)[0..len]);
+            return @ptrCast(value(self, field)[0..@intCast(len)]);
         }
 
         /// a slice of Layout.<flexible> with its capacity field.
@@ -418,12 +415,12 @@ pub fn Struct(LayoutT: type, options: Options) type {
             return @ptrCast(self);
         }
 
-        pub fn fromBytes(bytes: [*]align(ALIGN) const u8) *const Self {
-            return @ptrCast(bytes);
+        pub fn fromBytes(buf: [*]align(ALIGN) const u8) *const Self {
+            return @ptrCast(buf);
         }
 
-        pub fn fromBytesMut(bytes: [*]align(ALIGN) u8) *Self {
-            return @ptrCast(bytes);
+        pub fn fromBytesMut(buf: [*]align(ALIGN) u8) *Self {
+            return @ptrCast(buf);
         }
 
         // Self <-> Layout <-> bytes helpers // end
@@ -454,20 +451,21 @@ pub fn Struct(LayoutT: type, options: Options) type {
         }
 
         fn isField(field_or_decl: FieldOrDecl) bool {
-            return @intFromEnum(field_or_decl) < NFIELDS;
+            return @backingInt(field_or_decl) < NFIELDS;
         }
 
-        fn AlignOf(field: StructField) comptime_int {
+        fn AlignOf(field: Field) comptime_int {
+            const fieldty = layout_struct.field_types[@backingInt(field)];
             if (isFlexibleArray(field)) {
-                const pointer = @typeInfo(field.type).pointer;
-                return pointer.alignment orelse @alignOf(pointer.child);
+                const pointer = @typeInfo(fieldty).pointer;
+                return pointer.attrs.@"align" orelse @alignOf(pointer.child);
             }
-            return @alignOf(field.type);
+            return @alignOf(fieldty);
         }
 
         fn ElementOf(comptime field: Field) type {
             const T = @FieldType(Layout, @tagName(field));
-            return if (isFlexibleArray(layout_fields[@intFromEnum(field)]))
+            return if (isFlexibleArray(field))
                 meta.Elem(T)
             else
                 T;
@@ -488,23 +486,7 @@ pub fn Struct(LayoutT: type, options: Options) type {
         fn FieldSlice(comptime field: Field) type {
             const T = @FieldType(Layout, @tagName(field));
             const pointer = @typeInfo(T).pointer;
-            return @Pointer(.slice, .{
-                .@"addrspace" = pointer.address_space,
-                .@"align" = pointer.alignment,
-                .@"allowzero" = pointer.is_allowzero,
-                .@"const" = pointer.is_const,
-                .@"volatile" = pointer.is_volatile,
-            }, pointer.child, pointer.sentinel());
-        }
-
-        fn fieldAttrs(comptime fields: []const StructField) [fields.len]StructField.Attributes {
-            var attrs: [fields.len]std.builtin.Type.StructField.Attributes = undefined;
-            for (fields, &attrs) |f, *attr| attr.* = .{
-                .@"comptime" = f.is_comptime,
-                .@"align" = AlignOf(f),
-                .default_value_ptr = f.default_value_ptr,
-            };
-            return attrs;
+            return @Pointer(.slice, pointer.attrs, pointer.child, pointer.sentinel());
         }
     };
 }
@@ -520,7 +502,7 @@ fn mapFields(T: type, field: meta.FieldEnum(T), in: []const T) [in.len]@FieldTyp
 fn filterSlice(src: anytype, set: anytype) []const meta.Elem(@TypeOf(src)) {
     var ret: []const meta.Elem(@TypeOf(src)) = &.{};
     for (src, 0..) |f, i| {
-        if (set.contains(@enumFromInt(i)))
+        if (set.contains(@fromBackingInt(i)))
             ret = ret ++ .{f};
     }
     return ret;
@@ -608,8 +590,8 @@ fn testPacket(Size: type) !void {
 
     @memcpy(packet.slice(.host), host);
     try testing.expectEqualSlices(u8, host, packet.slice(.host));
-    try testing.expectEqual(layout.write_buf[0..layout.buf_lens], packet.slice(.write_buf));
-    try testing.expectEqual(layout.read_buf[0..layout.buf_lens], packet.slice(.read_buf));
+    try testing.expectEqual(layout.write_buf[0..@intCast(layout.buf_lens)], packet.slice(.write_buf));
+    try testing.expectEqual(layout.read_buf[0..@intCast(layout.buf_lens)], packet.slice(.read_buf));
     try testing.expectEqual(layout.host[0..layout.host_len], packet.slice(.host));
     try testing.expectEqual(layout.computed[0..layout.computedLen()], packet.slice(.computed));
 }
@@ -623,12 +605,12 @@ fn validateLayout(
     const self = try S.initBuffer(&buf, &layout);
     try testing.expectEqualSlices(S.Size, expected_offsets, &S.calcOffsetsLayout(&layout));
     inline for (S.flexible_field_ids) |flexiblefield| {
-        @memset(self.slice(flexiblefield), @intFromEnum(flexiblefield));
+        @memset(self.slice(flexiblefield), @backingInt(flexiblefield));
     }
     inline for (S.flexible_field_ids) |flexiblefield| {
         const slice = self.slice(flexiblefield);
-        try testing.expectEqual(@intFromEnum(flexiblefield), slice[0]);
-        try testing.expectEqual(@intFromEnum(flexiblefield), slice[slice.len - 1]);
+        try testing.expectEqual(@backingInt(flexiblefield), slice[0]);
+        try testing.expectEqual(@backingInt(flexiblefield), slice[slice.len - 1]);
     }
     const lensv = self.loadCapacities();
     inline for (S.capacity_field_ids, 0..) |capfield, i| {
@@ -748,5 +730,4 @@ const simd = std.simd;
 const math = std.math;
 const assert = std.debug.assert;
 const enums = std.enums;
-const StructField = std.builtin.Type.StructField;
 const builtin = @import("builtin");
