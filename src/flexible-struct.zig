@@ -242,12 +242,24 @@ pub fn Struct(LayoutT: type, options: Options) type {
             return calcOffsetsLayout(self.asLayout());
         }
 
+        /// change layout capacities. when mode is capacities_and_flexibles,
+        /// adjust flexible field offsets accordingly.
+        pub fn initCapacitiesPinned(
+            capacities: *const Capacities,
+            out: *Layout,
+            comptime mode: enum { capacities, capacities_and_flexibles },
+        ) void {
+            inline for (capacity_field_ids) |field| {
+                @field(out, @tagName(field)) = @intCast(@field(capacities, @tagName(field)));
+            }
+            if (mode == .capacities_and_flexibles)
+                writeFlexibleOffsets(@ptrCast(out), &calcOffsetsLayout(out));
+        }
+
         /// a Layout with given capacities and all other fields undefined.
         pub fn initCapacities(capacities: *const Capacities) Layout {
             var ret: Layout = undefined;
-            inline for (capacity_field_ids) |field| {
-                @field(ret, @tagName(field)) = @intCast(@field(capacities, @tagName(field)));
-            }
+            initCapacitiesPinned(capacities, &ret, .capacities);
             return ret;
         }
 
@@ -255,7 +267,7 @@ pub fn Struct(LayoutT: type, options: Options) type {
         /// along with any other fields needed by computed methods.
         pub fn sizeInBytesLayout(layout: *const Layout) Size {
             return if (NFLEX_FIELDS > 0)
-                calcOffsetsLayout(layout)[NFLEX_FIELDS - 1]
+                calcOffsetsLayout(layout)[NFLEX_FIELDS - 1] // TODO use layout instead of calculating. return alignFwd(lastfieldstart-start+lastfieldsize, ALIGN)
             else
                 FIRST_FLEX_OFFSET;
         }
@@ -278,6 +290,28 @@ pub fn Struct(LayoutT: type, options: Options) type {
             return Buf(&initCapacities(capacities));
         }
 
+        ///
+        pub fn writeFlexibleOffsets(buf: [*]align(ALIGN) u8, offs: *const FlexSizes) void {
+            const layoutm = fromBytesMut(buf);
+            const layout = layoutm.asLayoutMut();
+            assert(@intFromPtr(buf) == @intFromPtr(layout));
+            const nextoffs = simd.shiftElementsRight(offs.*, 1, FIRST_FLEX_OFFSET);
+            inline for (flexible_field_ids, nextoffs) |flexible, nextoff| {
+                const flexname = @tagName(flexible);
+                const flexptr = &@field(layout, flexname);
+                flexptr.* = @ptrCast(@alignCast(buf + @as(usize, @intCast(nextoff))));
+                if (meta.sentinel(@FieldType(Layout, flexname))) |sentinel| { // set sentinel
+                    const capacity = @field(flexible_array_capacities, flexname);
+                    const capname = @tagName(capacity);
+                    const len = if (@hasDecl(Layout, capname))
+                        @field(Layout, capname)(layout) // computed call
+                    else
+                        @field(layout, capname);
+                    flexptr.*[len] = sentinel;
+                }
+            }
+        }
+
         /// a copy of layout backed by buf and with flexible fields
         /// pointing into buf.
         pub fn initBuffer(buf: []align(ALIGN) u8, layout: *const Layout) mem.Allocator.Error!*Self {
@@ -288,21 +322,7 @@ pub fn Struct(LayoutT: type, options: Options) type {
             const offs = calcOffsetsLayout(layout);
             if (offs[offs.len - 1] > buf.len)
                 return error.OutOfMemory;
-            const nextoffs = simd.shiftElementsRight(offs, 1, FIRST_FLEX_OFFSET);
-            inline for (flexible_field_ids, nextoffs) |flexible, nextoff| {
-                const flexname = @tagName(flexible);
-                const flexptr = &@field(ret, flexname);
-                flexptr.* = @ptrCast(@alignCast(buf.ptr + @as(usize, @intCast(nextoff))));
-                if (meta.sentinel(@FieldType(Layout, flexname))) |sentinel| { // set sentinel
-                    const capacity = @field(flexible_array_capacities, flexname);
-                    const capname = @tagName(capacity);
-                    const len = if (@hasDecl(Layout, capname))
-                        @field(Layout, capname)(ret) // computed call
-                    else
-                        @field(ret, capname);
-                    flexptr.*[len] = sentinel;
-                }
-            }
+            writeFlexibleOffsets(buf.ptr, &offs);
             return @ptrCast(ret);
         }
 
@@ -425,29 +445,92 @@ pub fn Struct(LayoutT: type, options: Options) type {
 
         // Self <-> Layout <-> bytes helpers // end
 
-        /// copy field from src to dest. memcpy flexible fields and OOM if dst
-        /// slice is smaller than src.
-        pub fn copyField(dst: *Self, src: *const Self, comptime field: Field) mem.Allocator.Error!void {
+        /// write field from src to dest. @memcopy or @memmove flexible fields
+        /// depending on mode. write minimum length of dst and src.
+        fn writeField(
+            dst: *Self,
+            src: *const Self,
+            comptime field: Field,
+            comptime mode: enum { copy, move },
+        ) void {
             if (comptime flexible_field_set.contains(field)) {
                 const d = dst.slice(field);
                 const s = src.slice(field);
-                if (s.len > d.len)
-                    return error.OutOfMemory;
-                @memcpy(d.ptr, s);
+                const len = @min(d.len, s.len);
+                if (mode == .copy)
+                    @memcpy(d[0..len], s.ptr)
+                else
+                    @memmove(d[0..len], s.ptr);
             } else {
                 @field(dst.asLayoutMut(), @tagName(field)) = @field(src.asLayout(), @tagName(field));
             }
         }
 
+        /// copy field from src to dest. @memcpy flexible fields with minimum
+        /// length of dst and src.
+        pub fn copyField(dst: *Self, src: *const Self, comptime field: Field) void {
+            return dst.writeField(src, field, .copy);
+        }
+
+        /// move field from src to dest. @memmove flexible fields with minimum
+        /// length of dst and src.
+        pub fn moveField(dst: *Self, src: *const Self, comptime field: Field) void {
+            return dst.writeField(src, field, .move);
+        }
+
         /// copy all fields from src to dest with `copyField`
-        pub fn copy(dst: *Self, src: *const Self) mem.Allocator.Error!void {
+        pub fn copy(dst: *Self, src: *const Self) void {
             inline for (comptime meta.tags(Field)) |field| {
                 try dst.copyField(src, field);
             }
         }
 
-        inline fn isFlexibleArray(field: StructField) bool {
-            return flexible_field_set.contains(@field(Field, field.name));
+        /// move all fields from src to dest with `moveField`
+        pub fn move(dst: *Self, src: *const Self) void {
+            inline for (comptime meta.tags(Field)) |field| {
+                try dst.moveField(src, field);
+            }
+        }
+
+        /// shrink capacities.  modify flexible pointers and move contents.
+        ///
+        /// asserts capacities are <= self capacities.
+        pub fn shrinkCapacities(self: *Self, capacities: *const Capacities) void {
+            const layout = self.asLayoutMut();
+            const oldlayout align(ALIGN) = layout.*;
+
+            inline for (capacity_field_ids) |capacity| {
+                assert(@field(capacities, @tagName(capacity)) <= @field(oldlayout, @tagName(capacity)));
+            }
+            initCapacitiesPinned(capacities, layout, .capacities_and_flexibles);
+
+            comptime var i = flexible_field_ids.len;
+            inline while (i > 0) {
+                i -= 1;
+                const flexible = flexible_field_ids[i];
+                self.moveField(fromLayout(&oldlayout), flexible);
+            }
+        }
+
+        /// grow capacities.  modify flexible pointers and move contents.
+        ///
+        /// asserts capacities are >= self capacities.
+        pub fn growCapacities(self: *Self, capacities: *const Capacities) void {
+            const layout = self.asLayoutMut();
+            const oldlayout align(ALIGN) = layout.*;
+
+            inline for (capacity_field_ids) |capacity| {
+                assert(@field(capacities, @tagName(capacity)) >= @field(oldlayout, @tagName(capacity)));
+            }
+            initCapacitiesPinned(capacities, layout, .capacities_and_flexibles);
+
+            inline for (flexible_field_ids) |flexible| {
+                self.moveField(fromLayout(&oldlayout), flexible);
+            }
+        }
+
+        inline fn isFlexibleArray(field: Field) bool {
+            return flexible_field_set.contains(field);
         }
 
         fn isField(field_or_decl: FieldOrDecl) bool {
@@ -535,7 +618,22 @@ test Struct {
     try testing.expectEqual(42, model.asLayout().capacity); // Self <-> Layout
     try testing.expectEqual(42, Model.fromLayout(model.asLayout()).value(.capacity));
     try testing.expectEqual(68, model.slice(.computed).len);
-    try testing.expectEqual(136, model.sizeInBytes()); // 24+42+68(~8)=134(~8)=136
+    try testing.expectEqual(136, model.sizeInBytes()); // (24+42+68)~8=134~8=136
+
+    // change capacities then check last field (computed) has moved and retains values
+    @memset(model.slice(.computed), 69);
+    const computed1 = model.value(.computed);
+    model.shrinkCapacities(&.{ .capacity = 36 }); // shrink and move
+    try testing.expectEqual(128, model.sizeInBytes()); // (24+36+68)~8=128~8=128
+    const computed2 = model.value(.computed);
+    try testing.expectEqual(69, model.slice(.computed)[0]);
+    try testing.expectEqual(69, model.slice(.computed)[35]);
+    try testing.expectEqual(computed1 - 6, computed2);
+    model.growCapacities(&.{ .capacity = 48 }); // grow and move
+    try testing.expectEqual(144, model.sizeInBytes()); // (24+48+68)~8=140~8=144
+    try testing.expectEqual(69, model.slice(.computed)[0]);
+    try testing.expectEqual(69, model.slice(.computed)[35]);
+    try testing.expectEqual(computed1 + 6, model.value(.computed));
 
     try testPacket(usize);
     try testPacket(u32);
