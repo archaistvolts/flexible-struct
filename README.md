@@ -5,12 +5,13 @@ A single buffer layout library for structs with flexible fields.
 # About
 
 User defined `Layout` fields are first in memory with order determined by Zig.
-Flexible fields are second and sorted by descending alignment. With no padding,
-flexible offsets can be calculated in constant time (see `calcOffsets()`).
+Flexible fields are second and sorted by descending alignment. This allows
+offsets to be calculated with a SIMD prefix sum instead of an inline loop (see
+`calcOffsets()`).
 
 # Features
 
-1. Support all structs: auto, extern, packed
+1. Support any struct: auto, extern or packed.
 1. Constant time field access.
 1. APIs: Layout, Self and bytes.  Users can ptrCast between them.
 1. Computed fields.
@@ -65,3 +66,7 @@ More tests toward bottom of [src/flexible-struct.zig](src/flexible-struct.zig).
 ## License
 
 MIT
+
+## Contributing
+
+Human contributions very welcome!

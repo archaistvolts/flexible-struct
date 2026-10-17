@@ -2,7 +2,7 @@
     .name = .flexible_struct,
     .version = "0.0.0",
     .fingerprint = 0x22bf5df9702c352c,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
 
     .dependencies = .{},
 
