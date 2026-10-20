@@ -123,7 +123,6 @@ pub fn Struct(LayoutT: type, options: Options) type {
 
             break :blk .{ maxalign, flexsizes, nextflexaligns };
         };
-        const ALIGNMENT = layout_infos[0];
         const flex_field_sizes = layout_infos[1];
         /// `[2nd flexible field, ..., last flexible field, 1]`.
         ///
@@ -177,6 +176,7 @@ pub fn Struct(LayoutT: type, options: Options) type {
             break :ids ids;
         };
 
+        pub const ALIGNMENT = layout_infos[0];
         pub const ALIGN = ALIGNMENT.toByteUnits();
         pub const NFIELDS = layout_struct.field_names.len;
         pub const NCAP_FIELDS = capacity_field_set.count();
@@ -242,7 +242,7 @@ pub fn Struct(LayoutT: type, options: Options) type {
             return calcOffsetsLayout(self.asLayout());
         }
 
-        /// change layout capacities. or when mode=flexibles, set flexible field
+        /// change layout capacities. when mode=flexibles, set flexible field
         /// pointers according to capacities.
         pub fn initPinned(
             capacities: *const Capacities,
@@ -380,14 +380,38 @@ pub fn Struct(LayoutT: type, options: Options) type {
             return @bitCast(counts);
         }
 
-        pub fn create(allocator: mem.Allocator, capacities: *const Capacities) mem.Allocator.Error!*Self {
-            const layout = initCapacities(capacities);
-            const buf = try allocator.alignedAlloc(u8, ALIGNMENT, sizeInBytesLayout(&layout));
-            return try initBuffer(buf, &layout);
+        // *Sized variants: allow caller to obtain buffer size and avoid duplicate calculations.
+
+        /// to avoid duplicate sizeInBytes() calls, out_bufsize holds the result.
+        pub fn createLayoutSized(gpa: mem.Allocator, layout: *const Layout, out_bufsize: *usize) mem.Allocator.Error!*Self {
+            out_bufsize.* = sizeInBytesLayout(layout);
+            const buf = try gpa.alignedAlloc(u8, ALIGNMENT, out_bufsize.*);
+            errdefer gpa.free(buf);
+            return try initBuffer(buf, layout);
         }
 
-        pub fn destroy(self: *const Self, allocator: mem.Allocator) void {
-            allocator.free(self.asBytes()[0..self.sizeInBytes()]);
+        /// to avoid duplicate sizeInBytes() calls, out_bufsize holds the result.
+        pub fn createSized(gpa: mem.Allocator, capacities: *const Capacities, out_bufsize: *usize) mem.Allocator.Error!*Self {
+            return createLayoutSized(gpa, &initCapacities(capacities), out_bufsize);
+        }
+
+        pub fn createLayout(gpa: mem.Allocator, layout: *const Layout) mem.Allocator.Error!*Self {
+            const buf = try gpa.alignedAlloc(u8, ALIGNMENT, sizeInBytesLayout(layout));
+            errdefer gpa.free(buf);
+            return try initBuffer(buf, layout);
+        }
+
+        pub fn create(gpa: mem.Allocator, capacities: *const Capacities) mem.Allocator.Error!*Self {
+            return createLayout(gpa, &initCapacities(capacities));
+        }
+
+        /// free backing buffer with provided bufsize instead of sizeInBytes().
+        pub fn destroySized(self: *const Self, gpa: mem.Allocator, bufsize: usize) void {
+            gpa.free(self.asBytes()[0..bufsize]);
+        }
+
+        pub fn destroy(self: *const Self, gpa: mem.Allocator) void {
+            self.destroySized(gpa, self.sizeInBytes());
         }
 
         /// a Layout.<field> by value.
@@ -461,40 +485,35 @@ pub fn Struct(LayoutT: type, options: Options) type {
 
         // Self <-> Layout <-> bytes helpers // end
 
-        /// copy field from src to dest. @memcopy or @memmove flexible fields
-        /// depending on mode. use minimum of dst and src lens.
-        pub fn copyField(
+        /// copy flexible from src to dest. @memcopy or @memmove depending on
+        /// mode. uses minimum of dst and src lens.
+        pub fn copyFlexibleField(
             dst: *Self,
             src: *align(ALIGN) const Layout,
-            comptime field: Field,
+            comptime flexible: Field,
             comptime mode: enum { copy, move },
         ) void {
-            if (comptime flexible_field_set.contains(field)) {
-                const d = dst.slice(field);
-                const s = fromLayout(src).slice(field);
-                const len = @min(d.len, s.len);
-                switch (mode) {
-                    .copy => @memcpy(d[0..len], s.ptr),
-                    .move => @memmove(d[0..len], s.ptr),
-                }
-            } else {
-                @field(dst.asLayoutMut(), @tagName(field)) = @field(src.asLayout(), @tagName(field));
+            comptime assert(flexible_field_set.contains(flexible));
+
+            const d = dst.slice(flexible);
+            const s = fromLayout(src).slice(flexible);
+            const len = @min(d.len, s.len);
+            switch (mode) {
+                .copy => @memcpy(d.ptr[0..len], s.ptr),
+                .move => @memmove(d.ptr[0..len], s.ptr),
             }
         }
 
-        /// shrink capacities, modify flexible pointers and move flexible contents.
+        /// resize capacities, modify flexible pointers and move flexible contents.
         ///
-        /// asserts capacities are <= self capacities.
-        pub fn shrinkCapacities(self: *Self, capacities: *const Capacities) void {
+        /// caller is responsible for ensuring backing buffer has room.
+        pub fn resizeAssumeCapacity(self: *Self, capacities: *const Capacities) void {
             const layout = self.asLayoutMut();
-            inline for (capacity_field_ids) |capacity| {
-                assert(@field(capacities, @tagName(capacity)) <= @field(layout, @tagName(capacity)));
-            }
             const src align(ALIGN) = layout.*;
             initPinned(capacities, layout, .capacities_and_flexibles);
 
             inline for (flexible_field_ids[1..]) |flexible| {
-                self.copyField(&src, flexible, .move);
+                self.copyFlexibleField(&src, flexible, .move);
             }
         }
 
@@ -543,14 +562,6 @@ pub fn Struct(LayoutT: type, options: Options) type {
     };
 }
 
-fn mapFields(T: type, field: meta.FieldEnum(T), in: []const T) [in.len]@FieldType(T, @tagName(field)) {
-    const F = @FieldType(T, @tagName(field));
-    var out: [in.len]F = undefined;
-    for (in, &out) |i, *o|
-        o.* = @field(i, @tagName(field));
-    return out;
-}
-
 fn filterSlice(src: anytype, set: anytype) []const meta.Elem(@TypeOf(src)) {
     var ret: []const meta.Elem(@TypeOf(src)) = &.{};
     for (src, 0..) |f, i| {
@@ -579,9 +590,9 @@ test Struct {
     };
 
     const Model = Struct(Layout, .{});
-    const initlayout = Layout{ .capacity = 42 };
-    var buf: Model.Buf(&initlayout) align(Model.ALIGN) = undefined; // buffer must be aligned
-    const model = try Model.initBuffer(&buf, &initlayout);
+
+    var buf: Model.Buf(&.{ .capacity = 132 }) align(Model.ALIGN) = undefined; // buffer must be aligned
+    const model = try Model.initBuffer(&buf, &.{ .capacity = 42 });
     try testing.expectEqual(42, model.value(.capacity));
     try testing.expectEqual(42, model.slice(.flexible).len);
     try testing.expectEqual(42, model.asLayout().capacity); // Self <-> Layout
@@ -591,12 +602,19 @@ test Struct {
 
     // change capacities then check last field (computed) has moved and retains values
     @memset(model.slice(.computed), 69);
+    @memset(model.slice(.flexible), 72);
     const computed1 = model.value(.computed);
-    model.shrinkCapacities(&.{ .capacity = 32 });
+    model.resizeAssumeCapacity(&.{ .capacity = 32 });
     try testing.expectEqual(128, model.sizeInBytes()); // (24+32+68)~8=124~8=128
     try testing.expectEqual(69, model.slice(.computed)[0]);
-    try testing.expectEqual(69, model.slice(.computed)[model.value(.capacity) - 1]);
+    try testing.expectEqual(69, model.slice(.computed)[model.asLayout().computedLen() - 1]);
     try testing.expectEqual(computed1 - 10, model.value(.computed));
+
+    model.resizeAssumeCapacity(&.{ .capacity = 132 });
+    try testing.expectEqual(224, model.sizeInBytes()); // (24+132+68)~8=224~8=224
+    try testing.expectEqual(69, model.slice(.computed)[0]);
+    try testing.expectEqual(69, model.slice(.computed)[67]);
+    try testing.expectEqual(computed1 + 90, model.value(.computed));
 
     try testPacket(usize);
     try testPacket(u32);
