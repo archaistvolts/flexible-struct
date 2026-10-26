@@ -242,25 +242,24 @@ pub fn Struct(LayoutT: type, options: Options) type {
             return calcOffsetsLayout(self.asLayout());
         }
 
-        /// change layout capacities. when mode=flexibles, set flexible field
-        /// pointers according to capacities.
+        /// change layout capacities. when mode=capacities_and_flexibles, set
+        /// flexible field pointers according to capacities.
         pub fn initPinned(
             capacities: *const Capacities,
             out: *align(ALIGN) Layout,
-            comptime mode: enum { capacities, flexibles, capacities_and_flexibles },
+            comptime mode: enum { capacities_only, capacities_and_flexibles },
         ) void {
-            if (mode == .capacities or mode == .capacities_and_flexibles) {
-                inline for (capacity_field_ids) |field|
-                    @field(out, @tagName(field)) = @intCast(@field(capacities, @tagName(field)));
-            }
-            if (mode == .flexibles or mode == .capacities_and_flexibles)
+            inline for (capacity_field_ids) |field|
+                @field(out, @tagName(field)) = @intCast(@field(capacities, @tagName(field)));
+
+            if (mode == .capacities_and_flexibles)
                 setFlexibleFields(@ptrCast(out), &calcOffsetsLayout(&initCapacities(capacities)));
         }
 
         /// a Layout with given capacities and all other fields undefined.
         pub fn initCapacities(capacities: *const Capacities) Layout {
             var ret: Layout align(ALIGN) = undefined;
-            initPinned(capacities, &ret, .capacities);
+            initPinned(capacities, &ret, .capacities_only);
             return ret;
         }
 
@@ -380,7 +379,7 @@ pub fn Struct(LayoutT: type, options: Options) type {
             return @bitCast(counts);
         }
 
-        // *Sized variants: allow caller to obtain buffer size and avoid duplicate calculations.
+        // *Sized variants: allow caller to control buffer size to avoid duplicate calculations.
 
         /// to avoid duplicate sizeInBytes() calls, out_bufsize holds the result.
         pub fn createLayoutSized(gpa: mem.Allocator, layout: *const Layout, out_bufsize: *usize) mem.Allocator.Error!*Self {
@@ -504,16 +503,43 @@ pub fn Struct(LayoutT: type, options: Options) type {
             }
         }
 
-        /// resize capacities, modify flexible pointers and move flexible contents.
+        /// shrink capacities, modify flexible pointers and move flexible contents.
         ///
-        /// caller is responsible for ensuring backing buffer has room.
-        pub fn resizeAssumeCapacity(self: *Self, capacities: *const Capacities) void {
+        /// asserts each capacity is <= current capacity.
+        ///
+        /// the first flexible contents are not moved.
+        pub fn shrinkCapacities(self: *Self, capacities: *const Capacities) void {
             const layout = self.asLayoutMut();
+            inline for (capacity_field_ids) |capacity| {
+                assert(@field(capacities, @tagName(capacity)) <= @field(layout, @tagName(capacity)));
+            }
             const src align(ALIGN) = layout.*;
             initPinned(capacities, layout, .capacities_and_flexibles);
 
             inline for (flexible_field_ids[1..]) |flexible| {
                 self.copyFlexibleField(&src, flexible, .move);
+            }
+        }
+
+        /// grow capacities, modify flexible pointers and move flexible contents.
+        ///
+        /// asserts each capacity is >= current capacity.
+        ///
+        /// caller is responsible for ensuring backing buffer has room.
+        ///
+        /// the first flexible contents are not moved.
+        pub fn growCapacitiesAssume(self: *Self, capacities: *const Capacities) void {
+            const layout = self.asLayoutMut();
+            inline for (capacity_field_ids) |capacity| {
+                assert(@field(capacities, @tagName(capacity)) >= @field(layout, @tagName(capacity)));
+            }
+            const src align(ALIGN) = layout.*;
+            initPinned(capacities, layout, .capacities_and_flexibles);
+
+            comptime var flexible = flexible_field_ids.len;
+            inline while (flexible > 1) {
+                flexible -= 1;
+                self.copyFlexibleField(&src, flexible_field_ids[flexible], .move);
             }
         }
 
@@ -604,13 +630,13 @@ test Struct {
     @memset(model.slice(.computed), 69);
     @memset(model.slice(.flexible), 72);
     const computed1 = model.value(.computed);
-    model.resizeAssumeCapacity(&.{ .capacity = 32 });
+    model.shrinkCapacities(&.{ .capacity = 32 });
     try testing.expectEqual(128, model.sizeInBytes()); // (24+32+68)~8=124~8=128
     try testing.expectEqual(69, model.slice(.computed)[0]);
     try testing.expectEqual(69, model.slice(.computed)[model.asLayout().computedLen() - 1]);
     try testing.expectEqual(computed1 - 10, model.value(.computed));
 
-    model.resizeAssumeCapacity(&.{ .capacity = 132 });
+    model.growCapacitiesAssume(&.{ .capacity = 132 });
     try testing.expectEqual(224, model.sizeInBytes()); // (24+132+68)~8=224~8=224
     try testing.expectEqual(69, model.slice(.computed)[0]);
     try testing.expectEqual(69, model.slice(.computed)[67]);
